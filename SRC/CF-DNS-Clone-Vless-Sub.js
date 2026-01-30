@@ -2595,7 +2595,172 @@ document.addEventListener('DOMContentLoaded', async () => {
 
   document.getElementById('settingsForm').addEventListener('submit', saveSettings);
   document.getElementById('addDomainBtn').addEventListener('click', () => openModal('domainModal'));
-  document.getElementById('manualSyncBtn').addEventListener('click', (e) => handleStreamingRequest('/api/sync', e.target, document.getElementById('logOutput')));
+  document.getElementById('manualSyncBtn').addEventListener('click', async (e) => {
+    const btn = e.target;
+    const logOutput = document.getElementById('logOutput');
+    const allButtons = document.querySelectorAll('button');
+    
+    allButtons.forEach(b => b.disabled = true);
+    const originalBtnText = btn.textContent;
+    btn.innerHTML = '处理中...';
+    btn.setAttribute('aria-busy', 'true');
+    logOutput.style.display = 'block';
+    logOutput.textContent = '开始批量同步所有域名...\\n';
+    
+    try {
+      // 先同步系统域名
+      logOutput.textContent += '正在同步系统域名...\\n';
+      await fetchWithProgress('/api/domains/sync_system', logOutput, '系统域名同步');
+      
+      // 获取所有非系统域名
+      const nonSystemDomains = currentDomains.filter(d => !d.is_system && d.is_enabled);
+      
+      if (nonSystemDomains.length === 0) {
+        logOutput.textContent += '\\n没有需要同步的非系统域名。';
+      } else {
+        logOutput.textContent += \`\\n发现 \${nonSystemDomains.length} 个非系统域名需要同步。\\n\\n\`;
+        
+        // 按顺序同步，每个域名间隔3秒
+        for (let i = 0; i < nonSystemDomains.length; i++) {
+          const domain = nonSystemDomains[i];
+          logOutput.textContent += \`\\n正在同步域名 (\${i + 1}/\${nonSystemDomains.length}): \${domain.target_domain}\\n\`;
+          logOutput.scrollTop = logOutput.scrollHeight;
+          
+          try {
+            // 使用单个域名的同步API
+            await fetchWithProgress(\`/api/domains/\${domain.id}/sync\`, logOutput, domain.target_domain);
+          } catch(e) {
+            logOutput.textContent += \`\\n❌ 处理域名 \${domain.target_domain} 失败: \${e.message}\\n\`;
+          }
+          
+          // 如果不是最后一个域名，等待3秒
+          if (i < nonSystemDomains.length - 1) {
+            logOutput.textContent += '\\n等待1秒后继续下一个域名...\\n';
+            logOutput.scrollTop = logOutput.scrollHeight;
+            await new Promise(resolve => setTimeout(resolve, 1000));
+          }
+        }
+      }
+      
+      logOutput.textContent += '\\n所有域名同步任务执行完毕。';
+      await refreshDomains();
+      
+    } catch (e) {
+      logOutput.textContent += \`\\n❌ 批量同步失败: \${e.message}\\n\`;
+      showNotification('批量同步发生错误', 'error');
+    } finally {
+      allButtons.forEach(b => b.disabled = false);
+      btn.innerHTML = originalBtnText;
+      btn.removeAttribute('aria-busy');
+    }
+  });
+  
+  async function fetchWithProgress(apiUrl, logOutputElem, context = '') {
+    try {
+      const response = await fetch(apiUrl, { 
+        method: 'POST',
+        headers: {
+          'Content-Type': 'application/json'
+        }
+      });
+      
+      if (!response.ok) {
+        const err = await response.json().catch(() => ({ error: \`HTTP \${response.status}\` }));
+        throw new Error(err.error || '请求失败');
+      }
+      
+      // 对于流式响应，使用reader读取
+      const reader = response.body.getReader();
+      const decoder = new TextDecoder('utf-8');
+      
+      while (true) {
+        const { done, value } = await reader.read();
+        if (done) break;
+        
+        const chunk = decoder.decode(value, { stream: true });
+        // 处理SSE格式的数据
+        const lines = chunk.split('\\n\\n').filter(line => line.startsWith('data: '));
+        for (const line of lines) {
+          const message = line.substring(6); // 去掉"data: "
+          logOutputElem.textContent += \`\${message}\\n\`;
+          logOutputElem.scrollTop = logOutputElem.scrollHeight;
+        }
+      }
+      
+      logOutputElem.textContent += \`\\n✔ \${context} 同步完成\\n\`;
+      logOutputElem.scrollTop = logOutputElem.scrollHeight;
+      
+    } catch (error) {
+      logOutputElem.textContent += \`\\n❌ \${context} 同步失败: \${error.message}\\n\`;
+      logOutputElem.scrollTop = logOutputElem.scrollHeight;
+      throw error;
+    }
+  }
+
+  // 修改单个同步按钮的事件处理，使用新的fetchWithProgress函数
+  window.individualSync = async (id) => {
+    const domain = currentDomains.find(d => d.id === id);
+    if (!domain) return;
+    
+    const btn = document.querySelector(\`#domain-card-\${id} .card-actions button:first-child\`);
+    const originalText = btn.textContent;
+    btn.disabled = true;
+    btn.innerHTML = '同步中...';
+    
+    // 创建临时日志显示区域
+    const logOutput = document.getElementById('logOutput');
+    logOutput.style.display = 'block';
+    logOutput.textContent = \`开始同步域名: \${domain.target_domain}\\n\`;
+    logOutput.scrollTop = logOutput.scrollHeight;
+    
+    try {
+      await fetchWithProgress(\`/api/domains/\${id}/sync\`, logOutput, domain.target_domain);
+      await refreshDomains();
+    } catch (e) {
+      logOutput.textContent += \`\\n❌ 同步失败: \${e.message}\\n\`;
+    } finally {
+      btn.disabled = false;
+      btn.innerHTML = originalText;
+    }
+  };
+
+  // 辅助函数：调用单个域名的同步API并等待完成
+  async function fetchAndWait(apiUrl, logOutputElem) {
+    return new Promise((resolve, reject) => {
+      const eventSource = new EventSource(apiUrl);
+      let hasError = false;
+      
+      eventSource.onmessage = (event) => {
+        const message = event.data;
+        logOutputElem.textContent += message + '\\n';
+        logOutputElem.scrollTop = logOutputElem.scrollHeight;
+        
+        // 检测是否完成
+        if (message.includes('任务完成') || message.includes('内容已更新') || message.includes('内容一致')) {
+          eventSource.close();
+          if (!hasError) {
+            resolve();
+          }
+        }
+      };
+      
+      eventSource.onerror = (error) => {
+        hasError = true;
+        logOutputElem.textContent += \`\\n❌ 同步失败: \${error}\\n\`;
+        eventSource.close();
+        reject(new Error('同步失败'));
+      };
+      
+      // 设置超时
+      setTimeout(() => {
+        if (!hasError) {
+          logOutputElem.textContent += '\\n⚠️ 同步超时，继续下一个域名\\n';
+          eventSource.close();
+          resolve();
+        }
+      }, 60000); // 60秒超时
+    });
+  }
   document.getElementById('domainForm').addEventListener('submit', (e) => { e.preventDefault(); saveDomain(); });
   
   const singleResolveSwitch = document.getElementById('is_single_resolve');
@@ -2860,44 +3025,68 @@ const SECOND_TIER_STRATEGIES = SECOND_TIER_PROXIES.map((proxyFn, index) => {
 const ALL_STRATEGIES = {...FETCH_STRATEGIES, ...SECOND_TIER_STRATEGIES};
 
 async function probeSourceUrl(url, source) {
-  if (!url) {
-      throw new Error('URL is required for probing.');
-  }
-  
-  if (source && source.is_delayed) {
-    try {
-      const ips = await ALL_STRATEGIES['phantomjs_cloud_random_delay'](url, {});
-      if (ips && ips.length > 0) {
-        return { success: true, strategy: 'phantomjs_cloud_random_delay', ipCount: ips.length, sampleIps: ips.slice(0, 5) };
-      }
-    } catch (e) {
-      console.log(`Forced delay strategy failed for URL '${url}': ${e.message}`);
-      throw new Error('配置的延迟获取策略执行失败。请检查目标网站或稍后再试。');
+    if (!url) {
+        throw new Error('URL is required for probing.');
     }
-    throw new Error('配置的延迟获取策略未能提取到IP。');
-  }
-
-  const primaryStrategies = [_k(['direct','_regex']), _k(['phantomjs_cloud','_interactive'])];
-  for (const strategyName of primaryStrategies) {
+    
+    if (source && source.is_delayed) {
       try {
-          const ips = await ALL_STRATEGIES[strategyName](url, {});
-          if (ips && ips.length > 0) {
-              return { success: true, strategy: strategyName, ipCount: ips.length, sampleIps: ips.slice(0, 5) };
-          }
-      } catch (e) { console.log(`Tier 1 strategy '${strategyName}' failed for URL '${url}': ${e.message}`); }
-  }
-
-  for (const [strategyName, strategyFn] of Object.entries(SECOND_TIER_STRATEGIES)) {
-      try {
-          const ips = await strategyFn(url, {});
-          if (ips && ips.length > 0) {
-              return { success: true, strategy: strategyName, ipCount: ips.length, sampleIps: ips.slice(0, 5) };
-          }
-      } catch (e) { console.log(`Tier 2 strategy '${strategyName}' failed for URL '${url}': ${e.message}`); }
-  }
+        const ips = await ALL_STRATEGIES['phantomjs_cloud_random_delay'](url, {});
+        if (ips && ips.length > 0) {
+          // 处理IPv6地址格式以便显示
+          const processedIps = ips.map(ip => {
+            const ipv6Regex = /^(([0-9a-fA-F]{1,4}:){7,7}[0-9a-fA-F]{1,4}|([0-9a-fA-F]{1,4}:){1,7}:|([0-9a-fA-F]{1,4}:){1,6}:[0-9a-fA-F]{1,4}|([0-9a-fA-F]{1,4}:){1,5}(:[0-9a-fA-F]{1,4}){1,2}|([0-9a-fA-F]{1,4}:){1,4}(:[0-9a-fA-F]{1,4}){1,3}|([0-9a-fA-F]{1,4}:){1,3}(:[0-9a-fA-F]{1,4}){1,4}|([0-9a-fA-F]{1,4}:){1,2}(:[0-9a-fA-F]{1,4}){1,5}|[0-9a-fA-F]{1,4}:((:[0-9a-fA-F]{1,4}){1,6})|:((:[0-9a-fA-F]{1,4}){1,7}|:))$/i;
+            if (ipv6Regex.test(ip.trim())) {
+              return `[${ip.trim()}]`;
+            }
+            return ip.trim();
+          });
+          return { success: true, strategy: 'phantomjs_cloud_random_delay', ipCount: ips.length, sampleIps: processedIps.slice(0, 5) };
+        }
+      } catch (e) {
+        console.log(`Forced delay strategy failed for URL '${url}': ${e.message}`);
+        throw new Error('配置的延迟获取策略执行失败。请检查目标网站或稍后再试。');
+      }
+      throw new Error('配置的延迟获取策略未能提取到IP。');
+    }
   
-  throw new Error('所有探测方案均失败，无法从此URL提取IP。');
-}
+    const primaryStrategies = [_k(['direct','_regex']), _k(['phantomjs_cloud','_interactive'])];
+    for (const strategyName of primaryStrategies) {
+        try {
+            const ips = await ALL_STRATEGIES[strategyName](url, {});
+            if (ips && ips.length > 0) {
+              // 处理IPv6地址格式以便显示
+              const processedIps = ips.map(ip => {
+                const ipv6Regex = /^(([0-9a-fA-F]{1,4}:){7,7}[0-9a-fA-F]{1,4}|([0-9a-fA-F]{1,4}:){1,7}:|([0-9a-fA-F]{1,4}:){1,6}:[0-9a-fA-F]{1,4}|([0-9a-fA-F]{1,4}:){1,5}(:[0-9a-fA-F]{1,4}){1,2}|([0-9a-fA-F]{1,4}:){1,4}(:[0-9a-fA-F]{1,4}){1,3}|([0-9a-fA-F]{1,4}:){1,3}(:[0-9a-fA-F]{1,4}){1,4}|([0-9a-fA-F]{1,4}:){1,2}(:[0-9a-fA-F]{1,4}){1,5}|[0-9a-fA-F]{1,4}:((:[0-9a-fA-F]{1,4}){1,6})|:((:[0-9a-fA-F]{1,4}){1,7}|:))$/i;
+                if (ipv6Regex.test(ip.trim())) {
+                  return `[${ip.trim()}]`;
+                }
+                return ip.trim();
+              });
+              return { success: true, strategy: strategyName, ipCount: ips.length, sampleIps: processedIps.slice(0, 5) };
+            }
+        } catch (e) { console.log(`Tier 1 strategy '${strategyName}' failed for URL '${url}': ${e.message}`); }
+    }
+  
+    for (const [strategyName, strategyFn] of Object.entries(SECOND_TIER_STRATEGIES)) {
+        try {
+            const ips = await strategyFn(url, {});
+            if (ips && ips.length > 0) {
+              // 处理IPv6地址格式以便显示
+              const processedIps = ips.map(ip => {
+                const ipv6Regex = /^(([0-9a-fA-F]{1,4}:){7,7}[0-9a-fA-F]{1,4}|([0-9a-fA-F]{1,4}:){1,7}:|([0-9a-fA-F]{1,4}:){1,6}:[0-9a-fA-F]{1,4}|([0-9a-fA-F]{1,4}:){1,5}(:[0-9a-fA-F]{1,4}){1,2}|([0-9a-fA-F]{1,4}:){1,4}(:[0-9a-fA-F]{1,4}){1,3}|([0-9a-fA-F]{1,4}:){1,3}(:[0-9a-fA-F]{1,4}){1,4}|([0-9a-fA-F]{1,4}:){1,2}(:[0-9a-fA-F]{1,4}){1,5}|[0-9a-fA-F]{1,4}:((:[0-9a-fA-F]{1,4}){1,6})|:((:[0-9a-fA-F]{1,4}){1,7}|:))$/i;
+                if (ipv6Regex.test(ip.trim())) {
+                  return `[${ip.trim()}]`;
+                }
+                return ip.trim();
+              });
+              return { success: true, strategy: strategyName, ipCount: ips.length, sampleIps: processedIps.slice(0, 5) };
+            }
+        } catch (e) { console.log(`Tier 2 strategy '${strategyName}' failed for URL '${url}': ${e.message}`); }
+    }
+    
+    throw new Error('所有探测方案均失败，无法从此URL提取IP。');
+  }
 
 async function apiProbeIpSource(request) {
   const { url, is_delayed, delay_min, delay_max } = await request.json();
@@ -2911,21 +3100,33 @@ async function apiProbeIpSource(request) {
 }
 
 async function fetchIpsFromSource(source) {
-  const strategyFn = ALL_STRATEGIES[source.fetch_strategy];
-
-  if (!strategyFn) {
-      throw new Error(`Unknown fetch strategy: ${source.fetch_strategy}`);
-  }
-
-  const url = _du(source.url);
-  const delayOptions = source.is_delayed ? { delay_min: source.delay_min, delay_max: source.delay_max } : {};
-  const ips = await strategyFn(url, delayOptions);
+    const strategyFn = ALL_STRATEGIES[source.fetch_strategy];
   
-  if (!ips || ips.length === 0) {
-      throw new Error('No IPs found using the cached strategy.');
+    if (!strategyFn) {
+        throw new Error(`Unknown fetch strategy: ${source.fetch_strategy}`);
+    }
+  
+    const url = _du(source.url);
+    const delayOptions = source.is_delayed ? { delay_min: source.delay_min, delay_max: source.delay_max } : {};
+    const ips = await strategyFn(url, delayOptions);
+    
+    if (!ips || ips.length === 0) {
+        throw new Error('No IPs found using the cached strategy.');
+    }
+    
+    // 处理IPv6地址格式
+    const processedIps = ips.map(ip => {
+      // 检查是否是IPv6地址
+      const ipv6Regex = /^(([0-9a-fA-F]{1,4}:){7,7}[0-9a-fA-F]{1,4}|([0-9a-fA-F]{1,4}:){1,7}:|([0-9a-fA-F]{1,4}:){1,6}:[0-9a-fA-F]{1,4}|([0-9a-fA-F]{1,4}:){1,5}(:[0-9a-fA-F]{1,4}){1,2}|([0-9a-fA-F]{1,4}:){1,4}(:[0-9a-fA-F]{1,4}){1,3}|([0-9a-fA-F]{1,4}:){1,3}(:[0-9a-fA-F]{1,4}){1,4}|([0-9a-fA-F]{1,4}:){1,2}(:[0-9a-fA-F]{1,4}){1,5}|[0-9a-fA-F]{1,4}:((:[0-9a-fA-F]{1,4}){1,6})|:((:[0-9a-fA-F]{1,4}){1,7}|:))$/i;
+      
+      if (ipv6Regex.test(ip.trim())) {
+        return `[${ip.trim()}]`;
+      }
+      return ip.trim();
+    });
+    
+    return processedIps;
   }
-  return ips;
-}
 
 async function githubApiRequest(url, token, options = {}) {
   const headers = {
@@ -2981,30 +3182,44 @@ async function getGitHubContent(token, owner, repo, path) {
 }
 
 async function updateFileOnGitHub({ token, owner, repo, path, content, message, log }) {
-  if (!content || content.trim() === '') {
-    throw new Error("推送内容不能为空，已中止操作。");
-  }
-
-  await ensureRepoExists(token, owner, repo, log);
+    if (!content || content.trim() === '') {
+      throw new Error("推送内容不能为空，已中止操作。");
+    }
   
-  const apiUrl = `${_d([104,116,116,112,115,58,47,47,97,112,105,46,103,105,116,104,117,98,46,99,111,109,47,114,101,112,111,115,47])}${owner}/${repo}/contents/${path}`;
-  let sha;
-  try {
-      const getFileResponse = await githubApiRequest(apiUrl, token);
-      const fileData = await getFileResponse.json();
-      sha = fileData.sha;
-  } catch (e) {
-      if (!e.message.includes('404')) throw e;
-  }
+    // 处理IPv6地址，添加方括号
+    const processedContent = content.split('\n').map(line => {
+      const trimmedLine = line.trim();
+      // 检查是否是IPv6地址
+      const ipv6Regex = /^(([0-9a-fA-F]{1,4}:){7,7}[0-9a-fA-F]{1,4}|([0-9a-fA-F]{1,4}:){1,7}:|([0-9a-fA-F]{1,4}:){1,6}:[0-9a-fA-F]{1,4}|([0-9a-fA-F]{1,4}:){1,5}(:[0-9a-fA-F]{1,4}){1,2}|([0-9a-fA-F]{1,4}:){1,4}(:[0-9a-fA-F]{1,4}){1,3}|([0-9a-fA-F]{1,4}:){1,3}(:[0-9a-fA-F]{1,4}){1,4}|([0-9a-fA-F]{1,4}:){1,2}(:[0-9a-fA-F]{1,4}){1,5}|[0-9a-fA-F]{1,4}:((:[0-9a-fA-F]{1,4}){1,6})|:((:[0-9a-fA-F]{1,4}){1,7}|:))$/i;
+      
+      if (ipv6Regex.test(trimmedLine)) {
+        return `[${trimmedLine}]`;
+      }
+      return trimmedLine;
+    }).filter(line => line !== '').join('\n');
   
-  const body = JSON.stringify({
-      message,
-      content: btoa(unescape(encodeURIComponent(content))),
-      sha
-  });
-
-  await githubApiRequest(apiUrl, token, { method: 'PUT', body });
-}
+    await ensureRepoExists(token, owner, repo, log);
+    
+    const apiUrl = `${_d([104,116,116,112,115,58,47,47,97,112,105,46,103,105,116,104,117,98,46,99,111,109,47,114,101,112,111,115,47])}${owner}/${repo}/contents/${path}`;
+    let sha;
+    try {
+        const getFileResponse = await githubApiRequest(apiUrl, token);
+        const fileData = await getFileResponse.json();
+        sha = fileData.sha;
+    } catch (e) {
+        if (!e.message.includes('404')) throw e;
+    }
+    
+    const body = JSON.stringify({
+        message,
+        content: btoa(unescape(encodeURIComponent(processedContent))),
+        sha
+    });
+  
+    await githubApiRequest(apiUrl, token, { method: 'PUT', body });
+    
+    log(`推送内容已处理IPv6地址格式。`);
+  }
 
 function createLogStreamResponse(logFunction) {
   const { readable, writable } = new TransformStream();
@@ -3149,158 +3364,256 @@ async function pushAllChangesToGithub(env, log) {
 }
 
 async function handleGitHubFileProxy(fileName, env, ctx) {
-  const db = env.WUYA;
-  const githubSettings = await getGitHubSettings(db);
-  const source = await db.prepare("SELECT * FROM ip_sources WHERE github_path = ?").bind(fileName).first();
-
-  if (!source) {
-      return new Response('File not found or not managed by this service.', { status: 404 });
-  }
-
-  if (!githubSettings.token || !githubSettings.owner || !githubSettings.repo) {
-      return new Response('GitHub settings are not configured on the server.', { status: 500 });
-  }
+    const db = env.WUYA;
+    const githubSettings = await getGitHubSettings(db);
+    const source = await db.prepare("SELECT * FROM ip_sources WHERE github_path = ?").bind(fileName).first();
   
-  const cache = caches.default;
-  const cacheKey = new Request(new URL(fileName, _d([104,116,116,112,115,58,47,47,103,105,116,104,117,98,45,112,114,111,120,121,46,99,97,99,104,101])).toString());
-  let response = await cache.match(cacheKey);
-
-  if (!response) {
-      const apiUrl = `${_d([104,116,116,112,115,58,47,47,97,112,105,46,103,105,116,104,117,98,46,99,111,109,47,114,101,112,111,115,47])}${githubSettings.owner}/${githubSettings.repo}/contents/${fileName}`;
-      
-      const githubResponse = await githubApiRequest(apiUrl, githubSettings.token, {
-          headers: { 'Accept': 'application/vnd.github.v3.raw' }
-      });
-
-      if (!githubResponse.ok) {
-          return new Response('Failed to fetch file from GitHub.', { status: githubResponse.status });
-      }
-      
-      response = new Response(githubResponse.body, {
-          headers: {
-              'Content-Type': 'text/plain; charset=utf-8',
-              'Cache-Control': 's-maxage=300'
+    if (!source) {
+        return new Response('File not found or not managed by this service.', { status: 404 });
+    }
+  
+    if (!githubSettings.token || !githubSettings.owner || !githubSettings.repo) {
+        return new Response('GitHub settings are not configured on the server.', { status: 500 });
+    }
+    
+    const cache = caches.default;
+    const cacheKey = new Request(new URL(fileName, _d([104,116,116,112,115,58,47,47,103,105,116,104,117,98,45,112,114,111,120,121,46,99,97,99,104,101])).toString());
+    let response = await cache.match(cacheKey);
+  
+    if (!response) {
+        const apiUrl = `${_d([104,116,116,112,115,58,47,47,97,112,105,46,103,105,116,104,117,98,46,99,111,109,47,114,101,112,111,115,47])}${githubSettings.owner}/${githubSettings.repo}/contents/${fileName}`;
+        
+        const githubResponse = await githubApiRequest(apiUrl, githubSettings.token, {
+            headers: { 'Accept': 'application/vnd.github.v3.raw' }
+        });
+  
+        if (!githubResponse.ok) {
+            return new Response('Failed to fetch file from GitHub.', { status: githubResponse.status });
+        }
+        
+        const content = await githubResponse.text();
+        
+        // 处理IPv6地址格式
+        const processedContent = content.split('\n').map(line => {
+          const trimmedLine = line.trim();
+          // 检查是否是IPv6地址（可能已经带方括号，也可能没有）
+          const ipv6Regex = /^(([0-9a-fA-F]{1,4}:){7,7}[0-9a-fA-F]{1,4}|([0-9a-fA-F]{1,4}:){1,7}:|([0-9a-fA-F]{1,4}:){1,6}:[0-9a-fA-F]{1,4}|([0-9a-fA-F]{1,4}:){1,5}(:[0-9a-fA-F]{1,4}){1,2}|([0-9a-fA-F]{1,4}:){1,4}(:[0-9a-fA-F]{1,4}){1,3}|([0-9a-fA-F]{1,4}:){1,3}(:[0-9a-fA-F]{1,4}){1,4}|([0-9a-fA-F]{1,4}:){1,2}(:[0-9a-fA-F]{1,4}){1,5}|[0-9a-fA-F]{1,4}:((:[0-9a-fA-F]{1,4}){1,6})|:((:[0-9a-fA-F]{1,4}){1,7}|:))$/i;
+          
+          // 如果已经是带方括号的IPv6地址，保持原样
+          if (trimmedLine.startsWith('[') && trimmedLine.endsWith(']')) {
+            return trimmedLine;
           }
-      });
-      
-      ctx.waitUntil(cache.put(cacheKey, response.clone()));
+          
+          if (ipv6Regex.test(trimmedLine)) {
+            return `[${trimmedLine}]`;
+          }
+          return trimmedLine;
+        }).filter(line => line !== '').join('\n');
+        
+        response = new Response(processedContent, {
+            headers: {
+                'Content-Type': 'text/plain; charset=utf-8',
+                'Cache-Control': 's-maxage=300'
+            }
+        });
+        
+        ctx.waitUntil(cache.put(cacheKey, response.clone()));
+    }
+  
+    return response;
   }
 
-  return response;
-}
 async function syncDomainLogic(domain, token, zoneId, db, log, syncContext) {
-  log(`======== 开始同步: ${domain.target_domain} ========`);
-  try {
-      let recordsToUpdate;
-      if (domain.source_domain.startsWith('internal:hostmonit:')) {
-          const type = domain.source_domain.split(':')[2];
-          if (!syncContext.threeNetworkIps) {
-              throw new Error("三网优选IP上下文未准备好, 系统域名应该由 syncSystemDomainsAsUnit 处理。");
-          }
-          const ips = syncContext.threeNetworkIps[type] || [];
-          recordsToUpdate = ips.map(ip => ({ type: 'A', content: ip }));
-      } else if (domain.is_deep_resolve) {
-          log(`模式: 深度解析 (追踪CNAME)`);
-          recordsToUpdate = await resolveRecursively(domain.source_domain, log);
-      } else {
-          log(`模式: 浅层克隆 (直接克隆CNAME)`);
-          const cnames = await getDnsFromDoh(domain.source_domain, 'CNAME');
-          if (cnames.length > 0) {
-              recordsToUpdate = [{ type: 'CNAME', content: cnames[0].replace(/\.$/, "") }];
-          } else {
-              recordsToUpdate = [];
-          }
-      }
-
-      if (!recordsToUpdate || recordsToUpdate.length === 0) {
-          log(`警告: 源域名 ${domain.source_domain} 未解析到任何有效记录，本次跳过更新。`);
-          await db.prepare("UPDATE domains SET last_synced_time = CURRENT_TIMESTAMP, last_sync_status = 'failed', last_sync_error = ? WHERE id = ?").bind('源域名无解析', domain.id).run();
-          return;
-      }
-
-      const recordLimit = domain.resolve_record_limit || 10;
-      if (recordsToUpdate.length > recordLimit) {
-          log(`解析到 ${recordsToUpdate.length} 条记录，根据上限(${recordLimit})进行截取。`);
-          recordsToUpdate = recordsToUpdate.slice(0, recordLimit);
-      }
-      
-      const { allZoneRecords } = syncContext;
-      const zoneName = await getZoneName(token, zoneId);
-
-      let operations = [];
-
-      const existingMainRecords = allZoneRecords.filter(r => r.name === domain.target_domain);
-      const mainChanges = calculateDnsChanges(existingMainRecords, recordsToUpdate, domain);
-      operations.push(...mainChanges.toDelete.map(rec => ({ action: 'delete', record: rec })));
-      operations.push(...mainChanges.toAdd.map(rec => ({ action: 'add', record: rec, domain: domain })));
-
-      const targetPrefix = domain.target_domain.replace(`.${zoneName}`, '');
-      if (targetPrefix !== domain.target_domain) {
-          const singleResolveRegex = new RegExp(`^${targetPrefix.replace(/\./g, '\\.')}\\.\\d+\\.${zoneName.replace(/\./g, '\\.')}$`);
-          const existingSingleRecords = allZoneRecords.filter(r => singleResolveRegex.test(r.name));
-          
-          const recordsForSingleResolve = domain.is_single_resolve ? recordsToUpdate.slice(0, domain.single_resolve_limit || 5) : [];
-          
-          const newSingleDomainNames = new Set();
-          for (let i = 0; i < recordsForSingleResolve.length; i++) {
-              const singleDomainName = `${targetPrefix}.${i + 1}.${zoneName}`;
-              newSingleDomainNames.add(singleDomainName);
-              
-              const record = recordsForSingleResolve[i];
-              const existing = existingSingleRecords.filter(r => r.name === singleDomainName);
-              const singleDomain = { ...domain, target_domain: singleDomainName };
-              const changes = calculateDnsChanges(existing, [record], singleDomain);
-              operations.push(...changes.toDelete.map(rec => ({ action: 'delete', record: rec })));
-              operations.push(...changes.toAdd.map(rec => ({ action: 'add', record: rec, domain: singleDomain })));
-          }
-          
-          const recordsToClean = existingSingleRecords.filter(r => !newSingleDomainNames.has(r.name));
-          operations.push(...recordsToClean.map(rec => ({ action: 'delete', record: rec })));
-      }
-
-      if (operations.length === 0) {
-          log(`所有记录无变化，无需操作。`);
-          await db.prepare("UPDATE domains SET last_synced_records = ?, displayed_records = ?, last_synced_time = CURRENT_TIMESTAMP, last_sync_status = 'no_change', last_sync_error = NULL WHERE id = ?")
-            .bind(JSON.stringify(recordsToUpdate), JSON.stringify(recordsToUpdate), domain.id).run();
-          log(`✔ 同步完成 ${domain.target_domain} (内容一致)。`);
-      } else {
-          log(`共计 ${operations.length} 个操作待执行。`);
-          await executeDnsOperations(token, zoneId, operations, log);
-          await db.prepare("UPDATE domains SET last_synced_records = ?, displayed_records = ?, last_synced_time = CURRENT_TIMESTAMP, last_sync_status = 'success', last_sync_error = NULL WHERE id = ?")
-            .bind(JSON.stringify(recordsToUpdate), JSON.stringify(recordsToUpdate), domain.id).run();
-          log(`✔ 同步完成 ${domain.target_domain} (内容已更新)。`);
-      }
-
-  } catch (e) {
-      log(`❌ 同步 ${domain.target_domain} 失败: ${e.message}`);
-      await db.prepare("UPDATE domains SET last_synced_time = CURRENT_TIMESTAMP, last_sync_status = 'failed', last_sync_error = ? WHERE id = ?").bind(e.message, domain.id).run();
-      throw e;
+    log(`======== 开始同步: ${domain.target_domain} ========`);
+    try {
+        let recordsToUpdate;
+        if (domain.source_domain.startsWith('internal:hostmonit:')) {
+            const type = domain.source_domain.split(':')[2];
+            if (!syncContext.threeNetworkIps) {
+                throw new Error("三网优选IP上下文未准备好, 系统域名应该由 syncSystemDomainsAsUnit 处理。");
+            }
+            const ips = syncContext.threeNetworkIps[type] || [];
+            recordsToUpdate = ips.map(ip => ({ type: 'A', content: ip }));
+        } else if (domain.is_deep_resolve) {
+            log(`模式: 深度解析 (追踪CNAME)`);
+            recordsToUpdate = await resolveRecursively(domain.source_domain, log);
+        } else {
+            log(`模式: 浅层克隆 (直接克隆CNAME)`);
+            const cnames = await getDnsFromDoh(domain.source_domain, 'CNAME');
+            if (cnames.length > 0) {
+                recordsToUpdate = [{ type: 'CNAME', content: cnames[0].replace(/\.$/, "") }];
+            } else {
+                recordsToUpdate = [];
+            }
+        }
+  
+        if (!recordsToUpdate || recordsToUpdate.length === 0) {
+            log(`警告: 源域名 ${domain.source_domain} 未解析到任何有效记录，本次跳过更新。`);
+            await db.prepare("UPDATE domains SET last_synced_time = CURRENT_TIMESTAMP, last_sync_status = 'failed', last_sync_error = ? WHERE id = ?").bind('源域名无解析', domain.id).run();
+            return;
+        }
+  
+        const recordLimit = domain.resolve_record_limit || 10;
+        if (recordsToUpdate.length > recordLimit) {
+            log(`解析到 ${recordsToUpdate.length} 条记录，根据上限(${recordLimit})进行截取。`);
+            recordsToUpdate = recordsToUpdate.slice(0, recordLimit);
+        }
+        
+        const { allZoneRecords } = syncContext;
+        const zoneName = await getZoneName(token, zoneId);
+  
+        let operations = [];
+  
+        const existingMainRecords = allZoneRecords.filter(r => r.name === domain.target_domain);
+        const mainChanges = calculateDnsChanges(existingMainRecords, recordsToUpdate, domain);
+        operations.push(...mainChanges.toDelete.map(rec => ({ action: 'delete', record: rec })));
+        operations.push(...mainChanges.toAdd.map(rec => ({ action: 'add', record: rec, domain: domain })));
+  
+        const targetPrefix = domain.target_domain.replace(`.${zoneName}`, '');
+        if (targetPrefix !== domain.target_domain) {
+            const singleResolveRegex = new RegExp(`^${targetPrefix.replace(/\./g, '\\.')}\\.\\d+\\.${zoneName.replace(/\./g, '\\.')}$`);
+            const existingSingleRecords = allZoneRecords.filter(r => singleResolveRegex.test(r.name));
+            
+            const recordsForSingleResolve = domain.is_single_resolve ? recordsToUpdate.slice(0, domain.single_resolve_limit || 5) : [];
+            
+            const newSingleDomainNames = new Set();
+            for (let i = 0; i < recordsForSingleResolve.length; i++) {
+                const singleDomainName = `${targetPrefix}.${i + 1}.${zoneName}`;
+                newSingleDomainNames.add(singleDomainName);
+                
+                const record = recordsForSingleResolve[i];
+                const existing = existingSingleRecords.filter(r => r.name === singleDomainName);
+                const singleDomain = { ...domain, target_domain: singleDomainName };
+                const changes = calculateDnsChanges(existing, [record], singleDomain);
+                operations.push(...changes.toDelete.map(rec => ({ action: 'delete', record: rec })));
+                operations.push(...changes.toAdd.map(rec => ({ action: 'add', record: rec, domain: singleDomain })));
+            }
+            
+            const recordsToClean = existingSingleRecords.filter(r => !newSingleDomainNames.has(r.name));
+            operations.push(...recordsToClean.map(rec => ({ action: 'delete', record: rec })));
+        }
+  
+        if (operations.length === 0) {
+            log(`所有记录无变化，无需操作。`);
+            await db.prepare("UPDATE domains SET last_synced_records = ?, displayed_records = ?, last_synced_time = CURRENT_TIMESTAMP, last_sync_status = 'no_change', last_sync_error = NULL WHERE id = ?")
+              .bind(JSON.stringify(recordsToUpdate), JSON.stringify(recordsToUpdate), domain.id).run();
+            log(`✔ 同步完成 ${domain.target_domain} (内容一致)。`);
+        } else {
+            log(`共计 ${operations.length} 个操作待执行。`);
+            await executeDnsOperations(token, zoneId, operations, log);
+            await db.prepare("UPDATE domains SET last_synced_records = ?, displayed_records = ?, last_synced_time = CURRENT_TIMESTAMP, last_sync_status = 'success', last_sync_error = NULL WHERE id = ?")
+              .bind(JSON.stringify(recordsToUpdate), JSON.stringify(recordsToUpdate), domain.id).run();
+            log(`✔ 同步完成 ${domain.target_domain} (内容已更新)。`);
+        }
+  
+    } catch (e) {
+        log(`❌ 同步 ${domain.target_domain} 失败: ${e.message}`);
+        await db.prepare("UPDATE domains SET last_synced_time = CURRENT_TIMESTAMP, last_sync_status = 'failed', last_sync_error = ? WHERE id = ?").bind(e.message, domain.id).run();
+        throw e;
+    }
   }
-}
 
 async function syncSingleDomain(id, env, returnLogs, log = console.log) {
-  const db = env.WUYA;
-  const syncLogic = async (innerLog) => {
-      const { token, zoneId } = await getCfApiSettings(db);
-      if (!token || !zoneId) throw new Error("尚未配置 Cloudflare API 令牌或区域 ID。");
-      const domain = await db.prepare("SELECT * FROM domains WHERE id = ?").bind(id).first();
-      if (!domain) throw new Error(`未找到 ID 为 ${id} 的目标。`);
-      if (!domain.is_enabled) {
-          innerLog(`域名 ${domain.target_domain} 已被禁用，跳过同步。`);
-          return;
-      }
-      
-      const allZoneRecords = await listAllDnsRecords(token, zoneId);
-      const syncContext = { allZoneRecords };
-      await syncDomainLogic(domain, token, zoneId, db, innerLog, syncContext);
-  };
-
-  if (returnLogs) return createLogStreamResponse(syncLogic);
+    const db = env.WUYA;
+    const syncLogic = async (innerLog) => {
+        const { token, zoneId } = await getCfApiSettings(db);
+        if (!token || !zoneId) throw new Error("尚未配置 Cloudflare API 令牌或区域 ID。");
+        const domain = await db.prepare("SELECT * FROM domains WHERE id = ?").bind(id).first();
+        if (!domain) throw new Error(`未找到 ID 为 ${id} 的目标。`);
+        if (!domain.is_enabled) {
+            innerLog(`域名 ${domain.target_domain} 已被禁用，跳过同步。`);
+            return;
+        }
+        
+        const allZoneRecords = await listAllDnsRecords(token, zoneId);
+        const syncContext = { allZoneRecords };
+        
+        // 如果是系统域名，单独处理
+        if (domain.source_domain.startsWith('internal:hostmonit:')) {
+            innerLog(`系统域名 ${domain.target_domain} 应由系统域名同步统一处理`);
+            return;
+        }
+        
+        // 非系统域名，正常处理
+        let recordsToUpdate;
+        if (domain.is_deep_resolve) {
+            innerLog(`模式: 深度解析 (追踪CNAME)`);
+            recordsToUpdate = await resolveRecursively(domain.source_domain, innerLog);
+        } else {
+            innerLog(`模式: 浅层克隆 (直接克隆CNAME)`);
+            const cnames = await getDnsFromDoh(domain.source_domain, 'CNAME');
+            if (cnames.length > 0) {
+                recordsToUpdate = [{ type: 'CNAME', content: cnames[0].replace(/\.$/, "") }];
+            } else {
+                recordsToUpdate = [];
+            }
+        }
   
-  await syncLogic(log).catch(e => log(`[ERROR] ${e.message}`));
-}
+        if (!recordsToUpdate || recordsToUpdate.length === 0) {
+            innerLog(`警告: 源域名 ${domain.source_domain} 未解析到任何有效记录，本次跳过更新。`);
+            await db.prepare("UPDATE domains SET last_synced_time = CURRENT_TIMESTAMP, last_sync_status = 'failed', last_sync_error = ? WHERE id = ?").bind('源域名无解析', domain.id).run();
+            return;
+        }
+  
+        const recordLimit = domain.resolve_record_limit || 10;
+        if (recordsToUpdate.length > recordLimit) {
+            innerLog(`解析到 ${recordsToUpdate.length} 条记录，根据上限(${recordLimit})进行截取。`);
+            recordsToUpdate = recordsToUpdate.slice(0, recordLimit);
+        }
+        
+        const zoneName = await getZoneName(token, zoneId);
+  
+        let operations = [];
+  
+        const existingMainRecords = allZoneRecords.filter(r => r.name === domain.target_domain);
+        const mainChanges = calculateDnsChanges(existingMainRecords, recordsToUpdate, domain);
+        operations.push(...mainChanges.toDelete.map(rec => ({ action: 'delete', record: rec })));
+        operations.push(...mainChanges.toAdd.map(rec => ({ action: 'add', record: rec, domain: domain })));
+  
+        const targetPrefix = domain.target_domain.replace(`.${zoneName}`, '');
+        if (targetPrefix !== domain.target_domain) {
+            const singleResolveRegex = new RegExp(`^${targetPrefix.replace(/\./g, '\\.')}\\.\\d+\\.${zoneName.replace(/\./g, '\\.')}$`);
+            const existingSingleRecords = allZoneRecords.filter(r => singleResolveRegex.test(r.name));
+            
+            const recordsForSingleResolve = domain.is_single_resolve ? recordsToUpdate.slice(0, domain.single_resolve_limit || 5) : [];
+            
+            const newSingleDomainNames = new Set();
+            for (let i = 0; i < recordsForSingleResolve.length; i++) {
+                const singleDomainName = `${targetPrefix}.${i + 1}.${zoneName}`;
+                newSingleDomainNames.add(singleDomainName);
+                
+                const record = recordsForSingleResolve[i];
+                const existing = existingSingleRecords.filter(r => r.name === singleDomainName);
+                const singleDomain = { ...domain, target_domain: singleDomainName };
+                const changes = calculateDnsChanges(existing, [record], singleDomain);
+                operations.push(...changes.toDelete.map(rec => ({ action: 'delete', record: rec })));
+                operations.push(...changes.toAdd.map(rec => ({ action: 'add', record: rec, domain: singleDomain })));
+            }
+            
+            const recordsToClean = existingSingleRecords.filter(r => !newSingleDomainNames.has(r.name));
+            operations.push(...recordsToClean.map(rec => ({ action: 'delete', record: rec })));
+        }
+  
+        if (operations.length === 0) {
+            innerLog(`所有记录无变化，无需操作。`);
+            await db.prepare("UPDATE domains SET last_synced_records = ?, displayed_records = ?, last_synced_time = CURRENT_TIMESTAMP, last_sync_status = 'no_change', last_sync_error = NULL WHERE id = ?")
+              .bind(JSON.stringify(recordsToUpdate), JSON.stringify(recordsToUpdate), domain.id).run();
+            innerLog(`✔ 同步完成 ${domain.target_domain} (内容一致)。`);
+        } else {
+            innerLog(`共计 ${operations.length} 个操作待执行。`);
+            await executeDnsOperations(token, zoneId, operations, innerLog);
+            await db.prepare("UPDATE domains SET last_synced_records = ?, displayed_records = ?, last_synced_time = CURRENT_TIMESTAMP, last_sync_status = 'success', last_sync_error = NULL WHERE id = ?")
+              .bind(JSON.stringify(recordsToUpdate), JSON.stringify(recordsToUpdate), domain.id).run();
+            innerLog(`✔ 同步完成 ${domain.target_domain} (内容已更新)。`);
+        }
+    };
+  
+    if (returnLogs) return createLogStreamResponse(syncLogic);
+    
+    await syncLogic(log).catch(e => log(`[ERROR] ${e.message}`));
+  }
 
-async function syncSystemDomainsAsUnit(env, log) {
+  async function syncSystemDomainsAsUnit(env, log) {
     const db = env.WUYA;
     log("======== 开始同步三网优选域名(作为一个整体) ========");
     
@@ -3325,9 +3638,76 @@ async function syncSystemDomainsAsUnit(env, log) {
         const allZoneRecords = await listAllDnsRecords(token, zoneId);
         const syncContext = { allZoneRecords, threeNetworkIps };
 
+        // 为每个域名单独处理，而不是收集所有操作
         for (const domain of systemDomains) {
-            await syncDomainLogic(domain, token, zoneId, db, log, syncContext);
+            log(`处理系统域名: ${domain.target_domain}`);
+            
+            const type = domain.source_domain.split(':')[2];
+            const ips = threeNetworkIps[type] || [];
+            const recordsToUpdate = ips.map(ip => ({ type: 'A', content: ip }));
+            
+            if (recordsToUpdate.length === 0) {
+                log(`警告: 系统域名 ${domain.target_domain} 没有获取到IP，跳过更新。`);
+                continue;
+            }
+            
+            const recordLimit = domain.resolve_record_limit || 10;
+            const finalRecords = recordsToUpdate.slice(0, recordLimit);
+            
+            const existingMainRecords = allZoneRecords.filter(r => r.name === domain.target_domain);
+            const mainChanges = calculateDnsChanges(existingMainRecords, finalRecords, domain);
+            
+            let operations = [];
+            operations.push(...mainChanges.toDelete.map(rec => ({ action: 'delete', record: rec })));
+            operations.push(...mainChanges.toAdd.map(rec => ({ action: 'add', record: rec, domain: domain })));
+            
+            // 处理单个解析子域名
+            const zoneName = await getZoneName(token, zoneId);
+            const targetPrefix = domain.target_domain.replace(`.${zoneName}`, '');
+            if (targetPrefix !== domain.target_domain) {
+                const singleResolveRegex = new RegExp(`^${targetPrefix.replace(/\./g, '\\.')}\\.\\d+\\.${zoneName.replace(/\./g, '\\.')}$`);
+                const existingSingleRecords = allZoneRecords.filter(r => singleResolveRegex.test(r.name));
+                
+                const recordsForSingleResolve = domain.is_single_resolve ? finalRecords.slice(0, domain.single_resolve_limit || 5) : [];
+                
+                const newSingleDomainNames = new Set();
+                for (let i = 0; i < recordsForSingleResolve.length; i++) {
+                    const singleDomainName = `${targetPrefix}.${i + 1}.${zoneName}`;
+                    newSingleDomainNames.add(singleDomainName);
+                    
+                    const record = recordsForSingleResolve[i];
+                    const existing = existingSingleRecords.filter(r => r.name === singleDomainName);
+                    const singleDomain = { ...domain, target_domain: singleDomainName };
+                    const changes = calculateDnsChanges(existing, [record], singleDomain);
+                    operations.push(...changes.toDelete.map(rec => ({ action: 'delete', record: rec })));
+                    operations.push(...changes.toAdd.map(rec => ({ action: 'add', record: rec, domain: singleDomain })));
+                }
+                
+                const recordsToClean = existingSingleRecords.filter(r => !newSingleDomainNames.has(r.name));
+                operations.push(...recordsToClean.map(rec => ({ action: 'delete', record: rec })));
+            }
+            
+            // 执行操作
+            if (operations.length === 0) {
+                log(`系统域名 ${domain.target_domain} 所有记录无变化，无需操作。`);
+            } else {
+                log(`系统域名 ${domain.target_domain} 执行 ${operations.length} 个操作。`);
+                await executeDnsOperations(token, zoneId, operations, log);
+            }
+            
+            // 更新数据库状态
+            await db.prepare("UPDATE domains SET last_synced_records = ?, displayed_records = ?, last_synced_time = CURRENT_TIMESTAMP, last_sync_status = 'success', last_sync_error = NULL WHERE id = ?")
+                .bind(JSON.stringify(finalRecords), JSON.stringify(finalRecords), domain.id).run();
+            
+            log(`✔ 系统域名 ${domain.target_domain} 同步完成。`);
+            
+            // 在域名之间添加延迟，避免子请求过多
+            if (domain !== systemDomains[systemDomains.length - 1]) {
+                log(`等待2秒后处理下一个系统域名...`);
+                await new Promise(resolve => setTimeout(resolve, 2000));
+            }
         }
+        
         log("✔ 三网优选域名同步完成。");
     } catch(e) {
         log(`❌ 三网优选域名同步失败: ${e.message}`);
@@ -3337,33 +3717,165 @@ async function syncSystemDomainsAsUnit(env, log) {
     }
 }
 
-async function syncAllDomains(env, returnLogs, log = console.log) {
-  const db = env.WUYA;
-  const syncLogic = async (innerLog) => {
-    innerLog("开始批量同步所有域名...");
+// 新函数：计算域名操作但不执行
+async function calculateDomainOperations(domain, token, zoneId, db, log, syncContext) {
+    log(`处理域名: ${domain.target_domain}`);
     
-    await syncSystemDomainsAsUnit(env, innerLog).catch(e => innerLog(e.message));
-    
-    const { results: nonSystemDomains } = await db.prepare("SELECT * FROM domains WHERE is_enabled = 1 AND is_system = 0").all();
-    if (nonSystemDomains.length === 0) {
-      innerLog("没有需要同步的非系统域名。");
+    let recordsToUpdate;
+    if (domain.source_domain.startsWith('internal:hostmonit:')) {
+        const type = domain.source_domain.split(':')[2];
+        if (!syncContext.threeNetworkIps) {
+            throw new Error("三网优选IP上下文未准备好。");
+        }
+        const ips = syncContext.threeNetworkIps[type] || [];
+        recordsToUpdate = ips.map(ip => ({ type: 'A', content: ip }));
+    } else if (domain.is_deep_resolve) {
+        log(`模式: 深度解析 (追踪CNAME)`);
+        recordsToUpdate = await resolveRecursively(domain.source_domain, log);
     } else {
-      innerLog(`发现 ${nonSystemDomains.length} 个非系统域名需要同步。`);
-      for (const domain of nonSystemDomains) {
+        log(`模式: 浅层克隆 (直接克隆CNAME)`);
+        const cnames = await getDnsFromDoh(domain.source_domain, 'CNAME');
+        if (cnames.length > 0) {
+            recordsToUpdate = [{ type: 'CNAME', content: cnames[0].replace(/\.$/, "") }];
+        } else {
+            recordsToUpdate = [];
+        }
+    }
+
+    if (!recordsToUpdate || recordsToUpdate.length === 0) {
+        log(`警告: 源域名 ${domain.source_domain} 未解析到任何有效记录。`);
+        return [];
+    }
+
+    const recordLimit = domain.resolve_record_limit || 10;
+    if (recordsToUpdate.length > recordLimit) {
+        log(`解析到 ${recordsToUpdate.length} 条记录，根据上限(${recordLimit})进行截取。`);
+        recordsToUpdate = recordsToUpdate.slice(0, recordLimit);
+    }
+    
+    const { allZoneRecords } = syncContext;
+    const zoneName = await getZoneName(token, zoneId);
+
+    let operations = [];
+
+    const existingMainRecords = allZoneRecords.filter(r => r.name === domain.target_domain);
+    const mainChanges = calculateDnsChanges(existingMainRecords, recordsToUpdate, domain);
+    operations.push(...mainChanges.toDelete.map(rec => ({ action: 'delete', record: rec })));
+    operations.push(...mainChanges.toAdd.map(rec => ({ action: 'add', record: rec, domain: domain })));
+
+    const targetPrefix = domain.target_domain.replace(`.${zoneName}`, '');
+    if (targetPrefix !== domain.target_domain) {
+        const singleResolveRegex = new RegExp(`^${targetPrefix.replace(/\./g, '\\.')}\\.\\d+\\.${zoneName.replace(/\./g, '\\.')}$`);
+        const existingSingleRecords = allZoneRecords.filter(r => singleResolveRegex.test(r.name));
+        
+        const recordsForSingleResolve = domain.is_single_resolve ? recordsToUpdate.slice(0, domain.single_resolve_limit || 5) : [];
+        
+        const newSingleDomainNames = new Set();
+        for (let i = 0; i < recordsForSingleResolve.length; i++) {
+            const singleDomainName = `${targetPrefix}.${i + 1}.${zoneName}`;
+            newSingleDomainNames.add(singleDomainName);
+            
+            const record = recordsForSingleResolve[i];
+            const existing = existingSingleRecords.filter(r => r.name === singleDomainName);
+            const singleDomain = { ...domain, target_domain: singleDomainName };
+            const changes = calculateDnsChanges(existing, [record], singleDomain);
+            operations.push(...changes.toDelete.map(rec => ({ action: 'delete', record: rec })));
+            operations.push(...changes.toAdd.map(rec => ({ action: 'add', record: rec, domain: singleDomain })));
+        }
+        
+        const recordsToClean = existingSingleRecords.filter(r => !newSingleDomainNames.has(r.name));
+        operations.push(...recordsToClean.map(rec => ({ action: 'delete', record: rec })));
+    }
+    
+    return operations;
+}
+
+async function syncAllDomains(env, returnLogs, log = console.log) {
+    const db = env.WUYA;
+    const syncLogic = async (innerLog) => {
+      innerLog("开始批量同步所有域名...");
+      
+      try {
+        // 先同步系统域名
+        innerLog("正在同步系统域名...");
+        await syncSystemDomainsAsUnit(env, innerLog);
+        innerLog("系统域名同步完成。");
+      } catch(e) {
+        innerLog(`系统域名同步失败: ${e.message}`);
+      }
+      
+      // 获取所有非系统域名
+      const { results: nonSystemDomains } = await db.prepare("SELECT * FROM domains WHERE is_enabled = 1 AND is_system = 0 ORDER BY id").all();
+      if (nonSystemDomains.length === 0) {
+        innerLog("没有需要同步的非系统域名。");
+      } else {
+        innerLog(`发现 ${nonSystemDomains.length} 个非系统域名需要同步。`);
+        
+        // 按顺序同步，每个域名间隔3秒
+        for (let i = 0; i < nonSystemDomains.length; i++) {
+          const domain = nonSystemDomains[i];
+          innerLog(`正在同步域名 (${i + 1}/${nonSystemDomains.length}): ${domain.target_domain}`);
+          
           try {
-            await syncSingleDomain(domain.id, env, false, innerLog);
+            // 使用单个域名的同步API
+            await syncSingleDomain(domain.id, env, false, (msg) => {
+              innerLog(msg);
+            });
           } catch(e) {
             innerLog(`处理域名 ${domain.target_domain} 失败: ${e.message}`);
           }
+          
+          // 如果不是最后一个域名，等待3秒
+          if (i < nonSystemDomains.length - 1) {
+            innerLog(`等待3秒后继续下一个域名...`);
+            await new Promise(resolve => setTimeout(resolve, 3000));
+          }
+        }
       }
-    }
-    innerLog("所有域名同步任务执行完毕。");
-  };
-
-  if (returnLogs) return createLogStreamResponse(syncLogic);
+      innerLog("所有域名同步任务执行完毕。");
+    };
   
-  await syncLogic(log);
-}
+    if (returnLogs) return createLogStreamResponse(syncLogic);
+    
+    await syncLogic(log);
+  }
+  
+  // 辅助函数：调用单个域名的同步API并等待完成
+  async function fetchAndWait(apiUrl, log) {
+    return new Promise((resolve, reject) => {
+      const eventSource = new EventSource(apiUrl);
+      let hasError = false;
+      
+      eventSource.onmessage = (event) => {
+        const message = event.data;
+        log(message);
+        
+        // 检测是否完成
+        if (message.includes('任务完成') || message.includes('内容已更新') || message.includes('内容一致')) {
+          eventSource.close();
+          if (!hasError) {
+            resolve();
+          }
+        }
+      };
+      
+      eventSource.onerror = (error) => {
+        hasError = true;
+        log(`❌ 同步失败: ${error}`);
+        eventSource.close();
+        reject(new Error('同步失败'));
+      };
+      
+      // 设置超时
+      setTimeout(() => {
+        if (!hasError) {
+          log('⚠️ 同步超时，继续下一个域名');
+          eventSource.close();
+          resolve();
+        }
+      }, 60000); // 60秒超时
+    });
+  }
 
 async function syncSystemDomains(env, returnLogs) {
   return createLogStreamResponse((log) => syncSystemDomainsAsUnit(env, log));
@@ -3391,79 +3903,164 @@ log(`(深度 ${depth}) 未发现CNAME，查询最终IP for ${domain}`);
 const ipv4s = await getDnsFromDoh(domain, 'A');
 const ipv6s = await getDnsFromDoh(domain, 'AAAA');
 const validIPv4s = ipv4s.filter(ip => /^(?:(?:25[0-5]|2[0-4][0-9]|[01]?[0-9][0-9]?)\.){3}(?:25[0-5]|2[0-4][0-9]|[01]?[0-9][0-9]?)$/.test(ip));
-const validIPv6s = ipv6s.filter(ip => ipv6Regex.test(ip));
-const records = [...validIPv4s.map(ip => ({ type: 'A', content: ip })), ...validIPv6s.map(ip => ({ type: 'AAAA', content: ip }))];
+const validIPv6s = ipv6s.filter(ip => {
+  const ipv6Regex = /^(([0-9a-fA-F]{1,4}:){7,7}[0-9a-fA-F]{1,4}|([0-9a-fA-F]{1,4}:){1,7}:|([0-9a-fA-F]{1,4}:){1,6}:[0-9a-fA-F]{1,4}|([0-9a-fA-F]{1,4}:){1,5}(:[0-9a-fA-F]{1,4}){1,2}|([0-9a-fA-F]{1,4}:){1,4}(:[0-9a-fA-F]{1,4}){1,3}|([0-9a-fA-F]{1,4}:){1,3}(:[0-9a-fA-F]{1,4}){1,4}|([0-9a-fA-F]{1,4}:){1,2}(:[0-9a-fA-F]{1,4}){1,5}|[0-9a-fA-F]{1,4}:((:[0-9a-fA-F]{1,4}){1,6})|:((:[0-9a-fA-F]{1,4}){1,7}|:))$/i;
+  return ipv6Regex.test(ip);
+});
+const records = [
+  ...validIPv4s.map(ip => ({ type: 'A', content: ip })), 
+  ...validIPv6s.map(ip => ({ 
+    type: 'AAAA', 
+    content: ip  // DNS记录中IPv6地址不需要方括号
+  }))
+];
 return records;
 }
 
 function calculateDnsChanges(existingRecords, newRecords, domain) {
-  const { ttl, is_single_resolve } = domain;
+    const { ttl, is_single_resolve } = domain;
+    
+    const toDelete = [];
+    let toAdd = newRecords.map(r => ({ ...r, content: r.content.replace(/\.$/, "") }));
   
-  const toDelete = [];
-  let toAdd = newRecords.map(r => ({ ...r, content: r.content.replace(/\.$/, "") }));
-
-  if (!is_single_resolve) {
-      const sortFn = (a, b) => a.content.localeCompare(b.content);
-      toAdd.sort(sortFn);
-      existingRecords = [...existingRecords].sort(sortFn);
+    if (!is_single_resolve) {
+        const sortFn = (a, b) => a.content.localeCompare(b.content);
+        toAdd.sort(sortFn);
+        existingRecords = [...existingRecords].sort(sortFn);
+    }
+  
+    const newRecordIsCname = toAdd.some(r => r.type === 'CNAME');
+  
+    for (const existing of existingRecords) {
+        const normalizedExistingContent = existing.content.replace(/\.$/, "");
+        
+        // 如果新记录是CNAME而旧记录是A/AAAA/CNAME，或者反之，都需要删除旧记录
+        if ((newRecordIsCname && ['A', 'AAAA', 'CNAME'].includes(existing.type)) || 
+            (!newRecordIsCname && existing.type === 'CNAME')) {
+            toDelete.push(existing);
+            continue;
+        }
+        
+        // 查找匹配的记录
+        let foundExactMatch = false;
+        for (let i = toAdd.length - 1; i >= 0; i--) {
+            if (toAdd[i].type === existing.type && toAdd[i].content === normalizedExistingContent) {
+                // 检查是否需要更新TTL或代理状态
+                if (existing.proxied === false && existing.ttl === ttl) {
+                    // 完全相同，无需任何操作
+                    toAdd.splice(i, 1);
+                    foundExactMatch = true;
+                    break;
+                } else {
+                    // 内容相同但TTL或代理状态不同，需要删除旧记录再添加新记录
+                    toDelete.push(existing);
+                    // 保留toAdd中的记录，稍后会添加
+                    foundExactMatch = true;
+                    break;
+                }
+            }
+        }
+        
+        // 如果没有找到匹配的记录，删除旧记录
+        if (!foundExactMatch && ['A', 'AAAA', 'CNAME'].includes(existing.type)) {
+            toDelete.push(existing);
+        }
+    }
+    
+    return { toDelete, toAdd };
   }
+  
 
-  const newRecordIsCname = toAdd.some(r => r.type === 'CNAME');
-
-  for (const existing of existingRecords) {
-      const normalizedExistingContent = existing.content.replace(/\.$/, "");
-      if ((newRecordIsCname && ['A', 'AAAA', 'CNAME'].includes(existing.type)) || (!newRecordIsCname && existing.type === 'CNAME')) {
-          toDelete.push(existing);
-          continue;
-      }
-      let foundMatch = false;
-      for (let i = toAdd.length - 1; i >= 0; i--) {
-          if (toAdd[i].type === existing.type && toAdd[i].content === normalizedExistingContent) {
-              if(existing.proxied === false && existing.ttl === ttl) {
-                  toAdd.splice(i, 1);
-                  foundMatch = true;
-                  break;
-              }
-          }
-      }
-      if (!foundMatch && ['A', 'AAAA', 'CNAME'].includes(existing.type)) {
-          toDelete.push(existing);
-      }
-  }
-  return { toDelete, toAdd };
-}
-
-async function executeDnsOperations(token, zoneId, operations, log) {
-  const API_CHUNK_SIZE = 10;
-  const API_ENDPOINT = `${_d([104,116,116,112,115,58,47,47,97,112,105,46,99,108,111,117,100,102,108,97,114,101,46,99,111,109,47,99,108,105,101,110,116,47,118,52,47,122,111,110,101,115,47])}${zoneId}/dns_records`;
-  const headers = { 'Authorization': `Bearer ${token}`, 'Content-Type': 'application/json' };
-
-  const promises = operations.map(op => {
-      if (op.action === 'delete') {
-          log(`- 准备删除旧记录: [${op.record.type}] ${op.record.content} for ${op.record.name}`);
+  async function executeDnsOperations(token, zoneId, operations, log) {
+    const API_CHUNK_SIZE = 5; // 批处理大小
+    const API_ENDPOINT = `${_d([104,116,116,112,115,58,47,47,97,112,105,46,99,108,111,117,100,102,108,97,114,101,46,99,111,109,47,99,108,105,101,110,116,47,118,52,47,122,111,110,101,115,47])}${zoneId}/dns_records`;
+    const headers = { 'Authorization': `Bearer ${token}`, 'Content-Type': 'application/json' };
+  
+    log(`总计操作: ${operations.length}`);
+    
+    // 首先执行所有删除操作
+    const deleteOps = operations.filter(op => op.action === 'delete');
+    const addOps = operations.filter(op => op.action === 'add');
+    
+    // 先删除，等待一小段时间确保删除完成
+    if (deleteOps.length > 0) {
+      log(`开始执行 ${deleteOps.length} 个删除操作...`);
+      for (let i = 0; i < deleteOps.length; i += API_CHUNK_SIZE) {
+        const chunk = deleteOps.slice(i, i + API_CHUNK_SIZE);
+        
+        const promises = chunk.map(op => {
+          log(`- 删除旧记录: [${op.record.type}] ${op.record.content} for ${op.record.name}`);
           return () => fetch(`${API_ENDPOINT}/${op.record.id}`, { method: 'DELETE', headers });
-      }
-      if (op.action === 'add') {
-          const { record, domain } = op;
-          log(`+ 准备添加新记录: [${record.type}] ${record.content} for ${domain.target_domain}`);
-          return () => fetch(API_ENDPOINT, { method: 'POST', headers, body: JSON.stringify({ type: record.type, name: domain.target_domain, content: record.content, ttl: domain.ttl, proxied: false }) });
-      }
-      return null;
-  }).filter(Boolean);
-
-  for (let i = 0; i < promises.length; i += API_CHUNK_SIZE) {
-      const chunk = promises.slice(i, i + API_CHUNK_SIZE);
-      const responses = await Promise.all(chunk.map(p => p()));
-      for (const res of responses) {
+        }).filter(Boolean);
+  
+        const responses = await Promise.all(promises.map(p => p()));
+        for (const res of responses) {
           if (!res.ok) {
-              const errorBody = await res.json().catch(() => ({ errors: [{ code: 9999, message: 'Unknown error' }] }));
-              const errorMessage = (errorBody.errors || []).map(e => `(Code ${e.code}: ${e.message})`).join(', ');
-              log(`一个API调用失败: ${res.status} - ${errorMessage}`);
-              if (errorMessage) throw new Error(`Cloudflare API操作失败: ${errorMessage}`);
+            const errorBody = await res.json().catch(() => ({ errors: [{ code: 9999, message: 'Unknown error' }] }));
+            const errorMessage = (errorBody.errors || []).map(e => `(Code ${e.code}: ${e.message})`).join(', ');
+            throw new Error(`删除操作失败: ${res.status} - ${errorMessage}`);
           }
+        }
+        
+        // 在批处理之间添加延迟
+        if (i + API_CHUNK_SIZE < deleteOps.length) {
+          await new Promise(resolve => setTimeout(resolve, 1000));
+        }
       }
+      log(`删除操作完成。`);
+      
+      // 等待2秒，确保删除操作完全生效
+      log(`等待2秒，确保删除操作完全生效...`);
+      await new Promise(resolve => setTimeout(resolve, 2000));
+    }
+    
+    // 然后执行添加操作
+    if (addOps.length > 0) {
+      log(`开始执行 ${addOps.length} 个添加操作...`);
+      for (let i = 0; i < addOps.length; i += API_CHUNK_SIZE) {
+        const chunk = addOps.slice(i, i + API_CHUNK_SIZE);
+        
+        const promises = chunk.map(op => {
+          const { record, domain } = op;
+          log(`+ 添加新记录: [${record.type}] ${record.content} for ${domain.target_domain} (TTL: ${domain.ttl})`);
+          return () => fetch(API_ENDPOINT, { 
+            method: 'POST', 
+            headers, 
+            body: JSON.stringify({ 
+              type: record.type, 
+              name: domain.target_domain, 
+              content: record.content, 
+              ttl: domain.ttl, 
+              proxied: false 
+            }) 
+          });
+        }).filter(Boolean);
+  
+        const responses = await Promise.all(promises.map(p => p()));
+        for (const res of responses) {
+          if (!res.ok) {
+            const errorBody = await res.json().catch(() => ({ errors: [{ code: 9999, message: 'Unknown error' }] }));
+            const errorMessage = (errorBody.errors || []).map(e => `(Code ${e.code}: ${e.message})`).join(', ');
+            log(`添加操作失败详情: ${errorMessage}`);
+            throw new Error(`添加操作失败: ${res.status} - ${errorMessage}`);
+          }
+        }
+        
+        // 在批处理之间添加延迟
+        if (i + API_CHUNK_SIZE < addOps.length) {
+          await new Promise(resolve => setTimeout(resolve, 1000));
+        }
+      }
+      log(`添加操作完成。`);
+    }
+    
+    if (deleteOps.length === 0 && addOps.length === 0) {
+      log(`无需执行任何DNS操作。`);
+    }
+    
+    log(`所有DNS操作执行完成。`);
   }
-}
+  
 
 async function listAllDnsRecords(token, zoneId) {
   const API_ENDPOINT = `${_d([104,116,116,112,115,58,47,47,97,112,105,46,99,108,111,117,100,102,108,97,114,101,46,99,111,109,47,99,108,105,101,110,116,47,118,52,47,122,111,110,101,115,47])}${zoneId}/dns_records?per_page=500`;
